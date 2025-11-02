@@ -1,33 +1,98 @@
 services:
+  # PostgreSQL Database
   db:
-    image: postgres:16
+    image: postgres:15-alpine
+    container_name: loan-api-db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: microloans
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-microloans}
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d microloans"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
       timeout: 5s
-      retries: 10
-
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: ${DB_CPU_LIMIT:-1.0}
+          memory: ${DB_MEMORY_LIMIT:-512M}
+        reservations:
+          cpus: ${DB_CPU_RESERVE:-0.5}
+          memory: ${DB_MEMORY_RESERVE:-256M}
+    networks:
+      - loan-network
+  
+  # Loan API Application
   api:
-    build: .
-    environment:
-      FLASK_ENV: development
-      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/microloans
-      PORT: 8000
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: loan-api
+    environment: 
+      FLASK_ENV: ${FLASK_ENV:-development}
+      DATABASE_URL: postgresql+psycopg2://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-microloans}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PYTHONPATH: /app
+    ports:
+      - "${APP_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - ${VOLUME_MOUNT:-./logs}:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: ${API_CPU_LIMIT:-0.5}
+          memory: ${API_MEMORY_LIMIT:-512M}
+        reservations:
+          cpus: ${API_CPU_RESERVE:-0.25}
+          memory: ${API_MEMORY_RESERVE:-256M}
+    networks:
+      - loan-network
+    restart: ${RESTART_POLICY:-unless-stopped}
+    command: >
+      sh -c "
+        echo 'Waiting for database...' &&
+        sleep 5 &&
+        echo 'Running migrations...' &&
+        alembic upgrade head &&
+        echo 'Seeding database...' &&
+        python scripts/seed.py || echo 'Seed failed, continuing...' &&
+        echo 'Starting application...' &&
+        gunicorn --bind 0.0.0.0:8000 --workers 4 --timeout 60 --log-level ${LOG_LEVEL:-info} wsgi:app
+      "
+  
+  # Nginx Reverse Proxy with SSL
+  nginx:
+    image: nginx:alpine
+    container_name: loan-api-nginx
     ports:
-      - "8000:8000"
-    command: gunicorn -w 2 -b 0.0.0.0:8000 wsgi:app
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+    networks:
+      - loan-network
+    restart: unless-stopped
 
 volumes:
-  db_data:
+  postgres_data:
+
+networks:
+  loan-network:
+    driver: bridge
